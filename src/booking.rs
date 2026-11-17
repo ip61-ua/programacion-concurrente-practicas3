@@ -1,5 +1,6 @@
-use std::sync::{Arc, Mutex};
-use crate::venue::{self, SectorState};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use crate::venue::{self, ConcurrentSector};
 
 /// Trait que define las operaciones del motor de reservas (*Booker*).
 ///
@@ -7,9 +8,11 @@ use crate::venue::{self, SectorState};
 /// disponibilidad, reservar provisionalmente localidades y consolidar la compra.
 pub trait Booker {
     /// Nombre del recinto actual.
+    #[allow(dead_code)]
     fn get_venue_name(&self) -> &str;
 
     /// Capacidad total acumulada de todos los sectores del recinto.
+    #[allow(dead_code)]
     fn get_total_capacity(&self) -> usize;
 
     /// Número total de localidades disponibles actualmente en el recinto.
@@ -51,6 +54,7 @@ pub trait Booker {
     fn book_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<Vec<String>, String>;
 
     /// Devuelve una copia/instantánea del recinto (`Venue`) con el estado de todos sus sectores.
+    #[allow(dead_code)]
     fn get_venue(&self) -> venue::Venue;
 }
 
@@ -66,6 +70,7 @@ pub struct SequentialBooker {
 }
 
 impl SequentialBooker {
+    #[allow(dead_code)]
     pub fn new(venue: venue::Venue) -> Self {
         Self { venue }
     }
@@ -114,13 +119,9 @@ impl Booker for SequentialBooker {
         self.venue.total_capacity() - self.venue.total_booked_seats()
     }
 
-    fn select_sector(&mut self, _sector_code: &str) {
-        // En la versión secuencial básica no requiere acción adicional.
-    }
+    fn select_sector(&mut self, _sector_code: &str) {}
 
-    fn unselect_sector(&mut self, _sector_code: &str) {
-        // En la versión secuencial básica no requiere acción adicional.
-    }
+    fn unselect_sector(&mut self, _sector_code: &str) {}
 
     fn deselect_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String> {
         let sector = self
@@ -130,7 +131,6 @@ impl Booker for SequentialBooker {
             .find(|s| s.code == sector_code)
             .ok_or_else(|| format!("Unknown sector: '{sector_code}'"))?;
 
-        // 1. Validación: verificar que todos los asientos existen y están en estado Selected
         for seat_id in seat_ids {
             match sector.seats.iter().find(|s| s.id == *seat_id) {
                 Some(seat) if seat.state == venue::SeatState::Selected => {}
@@ -138,14 +138,11 @@ impl Booker for SequentialBooker {
                 None => return Err(format!("Seat {} does not exist in sector {}", seat_id, sector_code)),
             }
         }
-
-        // 2. Transición de estado: Selected -> Available
         for seat_id in seat_ids {
             if let Some(seat) = sector.seats.iter_mut().find(|s| s.id == *seat_id) {
                 seat.state = venue::SeatState::Available;
             }
         }
-
         Ok(())
     }
 
@@ -157,7 +154,6 @@ impl Booker for SequentialBooker {
             .find(|s| s.code == sector_code)
             .ok_or_else(|| format!("Unknown sector: '{sector_code}'"))?;
 
-        // 1. Validación: verificar que todos los asientos existen y están en estado Available
         for seat_id in seat_ids {
             match sector.seats.iter().find(|s| s.id == *seat_id) {
                 Some(seat) if seat.state == venue::SeatState::Available => {}
@@ -165,14 +161,11 @@ impl Booker for SequentialBooker {
                 None => return Err(format!("Seat {} does not exist in sector {}", seat_id, sector_code)),
             }
         }
-
-        // 2. Transición de estado: Available -> Selected
         for seat_id in seat_ids {
             if let Some(seat) = sector.seats.iter_mut().find(|s| s.id == *seat_id) {
                 seat.state = venue::SeatState::Selected;
             }
         }
-
         Ok(())
     }
 
@@ -184,7 +177,6 @@ impl Booker for SequentialBooker {
             .find(|s| s.code == sector_code)
             .ok_or_else(|| format!("Unknown sector: '{sector_code}'"))?;
 
-        // 1. Validación: verificar que todos los asientos existen y están en estado Selected
         for seat_id in seat_ids {
             match sector.seats.iter().find(|s| s.id == *seat_id) {
                 Some(seat) if seat.state == venue::SeatState::Selected => {}
@@ -197,14 +189,11 @@ impl Booker for SequentialBooker {
                 None => return Err(format!("Seat {} does not exist in sector {}", seat_id, sector_code)),
             }
         }
-
-        // 2. Transición de estado: Selected -> Booked
         for seat_id in seat_ids {
             if let Some(seat) = sector.seats.iter_mut().find(|s| s.id == *seat_id) {
                 seat.state = venue::SeatState::Booked;
             }
         }
-
         Ok(seat_ids.to_vec())
     }
 
@@ -214,31 +203,32 @@ impl Booker for SequentialBooker {
 }
 
 // ============================================================
-// Estado compartido del recinto para uso concurrente
+// Estado compartido del recinto para uso concurrente — sin Mutex
 // ============================================================
 
 /// Estado compartido entre todos los hilos compradores.
 ///
-/// Contiene un `Mutex<SectorState>` por sector (grano fino), un
-/// contador atómico de asientos restantes para el hot-path del loop,
-/// y contadores atómicos por sector para evitar adquirir locks
-/// innecesarios en `get_available_sectors`.
+/// Contiene un `ConcurrentSector` por sector — sin ningún `Mutex`.
+/// Todas las operaciones de estado de asientos se realizan mediante
+/// instrucciones CAS (`compare_exchange`) sobre los `AtomicU8` internos.
+///
+/// # Garantías
+/// - Libre de locks (lock-free) en el hot-path de compra.
+/// - `remaining`: `AtomicUsize` decrementado con `AcqRel` al confirmar ventas.
+/// - `sector_codes` / `sector_numbered`: inmutables tras construcción, sin sincronización.
 pub struct SharedVenueState {
     pub venue_name: String,
     pub total_capacity: usize,
-    /// Un Mutex independiente por sector — operaciones en sectores distintos son completamente paralelas.
-    pub sectors: Vec<Mutex<SectorState>>,
+    /// Un `ConcurrentSector` por sector — CAS interno, sin Mutex.
+    pub sectors: Vec<ConcurrentSector>,
     /// Mapa de código de sector → índice en `sectors` para lookup O(1).
     pub sector_index: std::collections::HashMap<String, usize>,
-    /// Códigos de sector pre-almacenados (evita clonar strings dentro de locks).
+    /// Códigos de sector pre-almacenados (lectura sin sincronización).
     sector_codes: Vec<String>,
-    /// Flags de numeración por sector (lectura sin lock).
+    /// Flags de numeración por sector (lectura sin sincronización).
     sector_numbered: Vec<bool>,
-    /// Contadores atómicos de asientos disponibles por sector.
-    /// Permiten filtrar sectores sin adquirir ningún Mutex en `get_available_sectors`.
-    sector_available: Vec<std::sync::atomic::AtomicUsize>,
-    /// Contador atómico de asientos restantes (capacity - booked).
-    /// Decrementado atómicamente al confirmar cada venta.
+    /// Contador atómico global de asientos restantes (capacity − booked).
+    /// Decrementado con `AcqRel` al confirmar cada venta.
     pub remaining: std::sync::atomic::AtomicUsize,
 }
 
@@ -249,14 +239,12 @@ impl SharedVenueState {
         let mut sector_index = std::collections::HashMap::with_capacity(venue.sectors.len());
         let mut sector_codes = Vec::with_capacity(venue.sectors.len());
         let mut sector_numbered = Vec::with_capacity(venue.sectors.len());
-        let mut sector_available = Vec::with_capacity(venue.sectors.len());
 
         for (i, s) in venue.sectors.iter().enumerate() {
             sector_index.insert(s.code.clone(), i);
             sector_codes.push(s.code.clone());
             sector_numbered.push(s.is_numbered);
-            sector_available.push(std::sync::atomic::AtomicUsize::new(s.capacity));
-            sectors.push(Mutex::new(SectorState::from_sector(s)));
+            sectors.push(ConcurrentSector::from_sector(s));
         }
 
         let total_capacity = venue.total_capacity();
@@ -268,7 +256,6 @@ impl SharedVenueState {
             sector_index,
             sector_codes,
             sector_numbered,
-            sector_available,
             remaining: std::sync::atomic::AtomicUsize::new(total_capacity),
         }
     }
@@ -279,14 +266,9 @@ impl SharedVenueState {
         *self.sector_index.get(code).unwrap_or_else(|| panic!("Unknown sector: '{}'", code))
     }
 
-    /// Reconstruye un `Venue` secuencial a partir del estado concurrente (snapshot).
+    /// Reconstruye un `Venue` secuencial haciendo un snapshot atómico del estado.
     pub fn to_venue(&self) -> venue::Venue {
-        let sectors = self
-            .sectors
-            .iter()
-            .map(|m| m.lock().unwrap().to_sector())
-            .collect();
-
+        let sectors = self.sectors.iter().map(|s| s.to_sector()).collect();
         venue::Venue {
             name: self.venue_name.clone(),
             sectors,
@@ -295,14 +277,18 @@ impl SharedVenueState {
 }
 
 // ============================================================
-// ConcurrentBooker — implementación del trait Booker con interior mutability
+// ConcurrentBooker — Booker lock-free sobre SharedVenueState
 // ============================================================
 
 /// Implementación concurrente del trait `Booker`.
 ///
 /// Cada hilo comprador tiene su propia instancia de `ConcurrentBooker`,
 /// pero todos comparten el mismo `Arc<SharedVenueState>` subyacente.
-/// Los métodos `&mut self` usan interior mutability (el estado real está detrás de Mutex).
+///
+/// **Todas las operaciones de estado de asientos son lock-free**:
+/// usan instrucciones CAS (`compare_exchange` sobre `AtomicU8`) en lugar
+/// de Mutex. Múltiples hilos pueden operar simultáneamente sobre el mismo
+/// sector sin esperar el uno al otro, con rollback automático ante conflictos.
 pub struct ConcurrentBooker {
     pub state: Arc<SharedVenueState>,
 }
@@ -322,100 +308,95 @@ impl Booker for ConcurrentBooker {
         self.state.total_capacity
     }
 
+    /// Suma los contadores atómicos aproximados por sector — sin ningún lock.
     fn get_total_available_seats(&self) -> usize {
         self.state
-            .sector_available
+            .sectors
             .iter()
-            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|s| s.n_available.load(Ordering::Relaxed))
             .sum()
     }
 
-    /// Devuelve los códigos de sectores que aún tienen asientos disponibles.
-    /// Usa contadores atómicos por sector: **cero locks adquiridos**.
+    /// Filtra sectores por su contador atómico de disponibles — cero locks.
+    /// Incorpora salvaguarda de vivacidad (liveness) cuando quedan pocas plazas.
     fn get_available_sectors(&self) -> Vec<String> {
-        self.state
-            .sector_available
+        let mut available: Vec<String> = self.state
+            .sectors
             .iter()
             .enumerate()
-            .filter_map(|(i, avail)| {
-                if avail.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            .filter_map(|(i, s)| {
+                if s.n_available.load(Ordering::Relaxed) > 0 {
                     Some(self.state.sector_codes[i].clone())
                 } else {
                     None
                 }
             })
-            .collect()
+            .collect();
+
+        // Salvaguarda de liveness: si ningún sector tiene disponibles inmediatos pero
+        // aún quedan entradas por vender en el recinto, ofrecer sectores con aforo no vendido
+        // (por si hay reservas provisionales en vuelo pendientes de confirmación o cancelación).
+        if available.is_empty() && self.remaining_seats() > 0 {
+            for (i, s) in self.state.sectors.iter().enumerate() {
+                if s.capacity > s.n_booked.load(Ordering::Relaxed) {
+                    available.push(self.state.sector_codes[i].clone());
+                }
+            }
+        }
+
+        available
     }
 
-    /// Lectura sin lock: dato pre-computado en construcción.
+    /// Lectura sin lock: dato pre-computado e inmutable.
     fn is_sector_numbered(&self, sector_code: &str) -> bool {
         let idx = self.state.sector_idx(sector_code);
         self.state.sector_numbered[idx]
     }
 
-    /// Devuelve los IDs de asientos disponibles en el sector.
-    /// Adquiere el lock del sector brevemente.
+    /// Recorre los `AtomicU8` del sector con cargas `Acquire` — sin lock.
     fn get_available_seats(&self, sector_code: &str) -> Vec<String> {
         let idx = self.state.sector_idx(sector_code);
-        self.state.sectors[idx].lock().unwrap().available_seat_ids()
+        self.state.sectors[idx].available_seat_ids()
     }
 
-    /// Consulta atómica: no requiere ningún lock de sector.
+    /// Lectura atómica global — sin lock.
     fn remaining_seats(&self) -> usize {
-        self.state.remaining.load(std::sync::atomic::Ordering::Relaxed)
+        self.state.remaining.load(Ordering::Relaxed)
     }
 
-    /// No-op en la implementación concurrente: no hay estado por sesión que gestionar.
+    /// No-op en la implementación concurrente.
     fn select_sector(&mut self, _sector_code: &str) {}
 
     /// No-op en la implementación concurrente.
     fn unselect_sector(&mut self, _sector_code: &str) {}
 
-    /// Libera la reserva provisional de los asientos indicados (Selected → Available).
-    /// Adquiere el lock del sector durante la operación y lo libera al salir.
-    /// Actualiza el contador atómico de disponibles del sector.
+    /// `Selected → Available` mediante CAS atómico — sin lock.
     fn deselect_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String> {
         let idx = self.state.sector_idx(sector_code);
-        let result = self.state.sectors[idx].lock().unwrap().deselect_seats(seat_ids);
-        if result.is_ok() {
-            self.state.sector_available[idx]
-                .fetch_add(seat_ids.len(), std::sync::atomic::Ordering::Relaxed);
-        }
-        result
+        self.state.sectors[idx].deselect_seats(seat_ids)
     }
 
-    /// Reserva provisional: Available → Selected.
-    ///
-    /// Si algún asiento ya no está disponible (fue tomado por otro hilo entre
-    /// `get_available_seats` y `select_seats`), retorna `Err` sin modificar nada.
-    /// El lock se mantiene durante toda la operación para garantizar atomicidad.
-    /// Actualiza el contador atómico de disponibles del sector.
+    /// `Available → Selected` mediante `compare_exchange(AcqRel)` — lock-free con rollback.
     fn select_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String> {
         let idx = self.state.sector_idx(sector_code);
-        let result = self.state.sectors[idx].lock().unwrap().select_seats(seat_ids);
-        if result.is_ok() {
-            self.state.sector_available[idx]
-                .fetch_sub(seat_ids.len(), std::sync::atomic::Ordering::Relaxed);
-        }
-        result
+        self.state.sectors[idx].select_seats(seat_ids)
     }
 
-    /// Confirma la venta definitiva: Selected → Booked.
+    /// `Selected → Booked` mediante `compare_exchange(AcqRel)` — lock-free con rollback.
     ///
-    /// Decrementa el contador atómico global `remaining` por el número de asientos vendidos.
-    /// El lock del sector garantiza que no hay doble-venta.
+    /// Decrementa el contador global `remaining` con `AcqRel` tras confirmar la venta.
     fn book_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<Vec<String>, String> {
         let idx = self.state.sector_idx(sector_code);
-        let result = self.state.sectors[idx].lock().unwrap().book_seats(seat_ids);
+        let result = self.state.sectors[idx].book_seats(seat_ids);
         if let Ok(ref tickets) = result {
             self.state
                 .remaining
-                .fetch_sub(tickets.len(), std::sync::atomic::Ordering::Relaxed);
+                .fetch_sub(tickets.len(), Ordering::AcqRel);
         }
         result
     }
 
-    /// Devuelve un snapshot del recinto (adquiere todos los locks secuencialmente).
+    /// Snapshot del recinto mediante cargas atómicas `Acquire` — sin locks.
     fn get_venue(&self) -> venue::Venue {
         self.state.to_venue()
     }

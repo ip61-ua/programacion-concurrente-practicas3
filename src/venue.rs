@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 // ============================================================
 // Modelos originales (requeridos por main.rs y SequentialBooker)
@@ -119,93 +120,100 @@ impl Sector {
 }
 
 // ============================================================
-// Estado interno concurrente por sector — full O(1) operations
+// Constantes de estado para los AtomicU8 por asiento
 // ============================================================
 
-/// Estado mutable protegido por `Mutex` para un sector concreto.
+/// Estado "libre" — el asiento puede ser seleccionado por cualquier hilo.
+pub const SEAT_AVAILABLE: u8 = 0;
+/// Estado "bloqueado provisionalmente" — sólo el hilo propietario puede liberarlo o confirmarlo.
+pub const SEAT_SELECTED: u8 = 1;
+/// Estado "vendido definitivamente" — estado terminal, nunca revierte.
+pub const SEAT_BOOKED: u8 = 2;
+
+// ============================================================
+// ConcurrentSector — estado por sector completamente lock-free con CAS
+// ============================================================
+
+/// Estado concurrente de un sector usando instrucciones CAS sobre `AtomicU8`.
 ///
-/// Tres índices garantizan operaciones O(1) amortizadas:
-/// - `seat_id_to_idx`: HashMap para resolver seat_id → índice en O(1).
-/// - `available`: Vec desordenado de índices disponibles (stack: push/pop O(1)).
-/// - `available_pos`: Mapa inverso seat_index → posición en `available` para
-///   eliminación O(1) por swap-pop sin búsqueda lineal.
-pub struct SectorState {
+/// **Sin ningún Mutex**: todos los accesos al estado de los asientos son
+/// operaciones atómicas de bajo nivel. Múltiples hilos pueden operar sobre
+/// el mismo sector concurrentemente sin esperas (wait-free en el caso exitoso,
+/// lock-free en general).
+///
+/// # Invariantes CAS
+/// - `select_seats`: `compare_exchange(AVAILABLE → SELECTED)` atómico por asiento.
+///   Si algún CAS falla, se hace rollback atómico de los ya realizados.
+/// - `book_seats`: `compare_exchange(SELECTED → BOOKED)` atómico por asiento.
+///   Si algún CAS falla, se hace rollback a `SELECTED`.
+/// - `deselect_seats`: `compare_exchange(SELECTED → AVAILABLE)` atómico por asiento.
+pub struct ConcurrentSector {
     /// Nombre descriptivo del sector.
     pub name: String,
     /// Código corto del sector (ej. "ST", "GC", "S1").
     pub code: String,
     /// ¿Los asientos son numerados?
     pub is_numbered: bool,
-    /// IDs de todos los asientos del sector (inmutable tras construcción).
+    /// IDs de todos los asientos (inmutables tras construcción).
     pub seat_ids: Vec<String>,
-    /// Mapa de seat_id → índice en `seat_ids` / `seat_states` para lookup O(1).
+    /// Mapa seat_id → índice en O(1). Inmutable tras construcción — sin sincronización.
     seat_id_to_idx: HashMap<String, usize>,
-    /// Estado de cada asiento, indexado por posición en `seat_ids`.
-    pub seat_states: Vec<SeatState>,
-    /// Índices (en `seat_ids`) de los asientos actualmente `Available`.
-    /// Se mantiene como pila desordenada: pop/push O(1).
-    pub available: Vec<usize>,
-    /// Mapa inverso: seat_index → posición en `available`.
-    /// Permite eliminar de `available` en O(1) por swap-pop sin búsqueda lineal.
-    /// Valor `usize::MAX` indica que el asiento no está en `available`.
-    available_pos: Vec<usize>,
-    /// Número de asientos en estado `Booked` en este sector.
-    pub n_booked: usize,
+    /// Estado atómico de cada asiento: `SEAT_AVAILABLE` / `SEAT_SELECTED` / `SEAT_BOOKED`.
+    ///
+    /// La transición se realiza mediante `compare_exchange` (CAS), garantizando
+    /// que sólo un hilo puede cambiar el estado de un asiento en cada momento.
+    seat_states: Vec<AtomicU8>,
     /// Capacidad total del sector.
     pub capacity: usize,
+    /// Contador atómico aproximado de asientos disponibles.
+    /// Usado para filtrar rápidamente sectores sin recorrer `seat_states`.
+    pub n_available: AtomicUsize,
+    /// Contador atómico de asientos vendidos definitivamente.
+    pub n_booked: AtomicUsize,
 }
 
-impl SectorState {
+// SAFETY: Vec<AtomicU8> y AtomicUsize son Send+Sync. HashMap con claves/valores
+// inmutables tras construcción también es Send+Sync.
+unsafe impl Send for ConcurrentSector {}
+unsafe impl Sync for ConcurrentSector {}
+
+impl ConcurrentSector {
     /// Construye el estado concurrente de un sector a partir del modelo secuencial.
     pub fn from_sector(sector: &Sector) -> Self {
         let n = sector.seats.len();
         let seat_ids: Vec<String> = sector.seats.iter().map(|s| s.id.clone()).collect();
-        let seat_states: Vec<SeatState> = sector.seats.iter().map(|s| s.state.clone()).collect();
-        // Inicialmente todos los asientos están Available
-        let available: Vec<usize> = (0..n).collect();
-        // available_pos[i] = i (posición inicial coincide con el índice)
-        let available_pos: Vec<usize> = (0..n).collect();
 
-        // Construir HashMap para lookup O(1)
+        // Construir HashMap inmutable para lookup O(1).
         let seat_id_to_idx: HashMap<String, usize> = seat_ids
             .iter()
             .enumerate()
             .map(|(i, id)| (id.clone(), i))
             .collect();
 
-        SectorState {
+        // Un AtomicU8 por asiento, todos inicializados a AVAILABLE.
+        let seat_states: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(SEAT_AVAILABLE)).collect();
+
+        ConcurrentSector {
             name: sector.name.clone(),
             code: sector.code.clone(),
             is_numbered: sector.is_numbered,
-            capacity: sector.capacity,
+            capacity: n,
             seat_ids,
             seat_id_to_idx,
             seat_states,
-            available,
-            available_pos,
-            n_booked: 0,
+            n_available: AtomicUsize::new(n),
+            n_booked: AtomicUsize::new(0),
         }
     }
 
-    /// Número de asientos disponibles actualmente.
-    #[inline]
-    pub fn n_available(&self) -> usize {
-        self.available.len()
-    }
-
-    /// Número de asientos vendidos definitivamente.
+    /// Número de asientos disponibles (contador atómico aproximado).
     #[inline]
     #[allow(dead_code)]
-    pub fn n_booked(&self) -> usize {
-        self.n_booked
+    pub fn n_available(&self) -> usize {
+        self.n_available.load(Ordering::Relaxed)
     }
 
-    /// Devuelve los IDs de todos los asientos actualmente disponibles.
-    pub fn available_seat_ids(&self) -> Vec<String> {
-        self.available.iter().map(|&i| self.seat_ids[i].clone()).collect()
-    }
-
-    /// Busca el índice interno de un seat_id. O(1) gracias al HashMap.
+    /// Busca el índice interno de un seat_id en O(1) mediante el HashMap inmutable.
     #[inline]
     fn lookup(&self, seat_id: &str) -> Result<usize, String> {
         self.seat_id_to_idx
@@ -214,114 +222,133 @@ impl SectorState {
             .ok_or_else(|| format!("Seat {} not found in sector {}", seat_id, self.code))
     }
 
-    /// Elimina un seat_index del vector `available` en O(1) usando swap-pop
-    /// y actualiza el mapa inverso `available_pos`.
-    #[inline]
-    fn remove_from_available(&mut self, seat_idx: usize) {
-        let pos = self.available_pos[seat_idx];
-        debug_assert!(pos < self.available.len());
-
-        let last = self.available.len() - 1;
-        if pos != last {
-            // Swap con el último elemento
-            let swapped_seat_idx = self.available[last];
-            self.available.swap(pos, last);
-            // Actualizar la posición del elemento que se movió
-            self.available_pos[swapped_seat_idx] = pos;
-        }
-        self.available.pop();
-        // Marcar como no-disponible
-        self.available_pos[seat_idx] = usize::MAX;
-    }
-
-    /// Añade un seat_index al vector `available` y actualiza el mapa inverso.
-    #[inline]
-    fn add_to_available(&mut self, seat_idx: usize) {
-        let pos = self.available.len();
-        self.available.push(seat_idx);
-        self.available_pos[seat_idx] = pos;
-    }
-
-    /// Intenta marcar los asientos indicados como `Selected` (reserva provisional).
+    /// Devuelve los IDs de todos los asientos actualmente disponibles.
     ///
-    /// Si algún asiento no está `Available`, retorna `Err` sin modificar nada.
-    /// Complejidad: O(k) donde k = número de asientos solicitados (todas las
-    /// operaciones internas son O(1) amortizadas).
-    pub fn select_seats(&mut self, seat_ids: &[String]) -> Result<(), String> {
-        // Encontrar los índices de los asientos solicitados y validarlos
-        let mut indices_to_select: Vec<usize> = Vec::with_capacity(seat_ids.len());
+    /// Recorre `seat_states` con cargas atómicas `Acquire` — sin lock.
+    /// O(capacity), pero completamente libre de contención.
+    pub fn available_seat_ids(&self) -> Vec<String> {
+        let approx = self.n_available.load(Ordering::Relaxed);
+        let mut available = Vec::with_capacity(approx);
+        for (i, s) in self.seat_states.iter().enumerate() {
+            if s.load(Ordering::Acquire) == SEAT_AVAILABLE {
+                available.push(self.seat_ids[i].clone());
+            }
+        }
+        available
+    }
+
+    /// Reserva provisional: `Available → Selected` mediante CAS atómico por asiento.
+    ///
+    /// Si algún `compare_exchange` falla (el asiento fue tomado por otro hilo),
+    /// se realiza rollback atómico de todos los CAS ya realizados, devolviendo
+    /// los asientos al estado `Available`. Todo sin locks.
+    ///
+    /// Complejidad: O(k) amortizado, k = número de asientos solicitados.
+    pub fn select_seats(&self, seat_ids: &[String]) -> Result<(), String> {
+        let mut cas_done: Vec<usize> = Vec::with_capacity(seat_ids.len());
+
         for seat_id in seat_ids {
             let idx = self.lookup(seat_id)?;
-            if self.seat_states[idx] != SeatState::Available {
-                return Err(format!("Seat {} is not available", seat_id));
+
+            match self.seat_states[idx].compare_exchange(
+                SEAT_AVAILABLE,
+                SEAT_SELECTED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => cas_done.push(idx),
+                Err(_) => {
+                    // Rollback atómico: devolver todos los asientos ya seleccionados a Available.
+                    for &i in &cas_done {
+                        self.seat_states[i].store(SEAT_AVAILABLE, Ordering::Release);
+                    }
+                    return Err(format!("Seat {} is not available", seat_id));
+                }
             }
-            indices_to_select.push(idx);
         }
 
-        // Transición Available → Selected y actualizar el índice de disponibles
-        for &idx in &indices_to_select {
-            self.seat_states[idx] = SeatState::Selected;
-            self.remove_from_available(idx);
-        }
-
+        // Actualizar el contador aproximado de disponibles.
+        self.n_available.fetch_sub(seat_ids.len(), Ordering::Relaxed);
         Ok(())
     }
 
-    /// Libera la reserva provisional de los asientos indicados (Selected → Available).
+    /// Libera la reserva provisional: `Selected → Available` mediante CAS atómico.
     ///
     /// Complejidad: O(k).
-    pub fn deselect_seats(&mut self, seat_ids: &[String]) -> Result<(), String> {
+    pub fn deselect_seats(&self, seat_ids: &[String]) -> Result<(), String> {
+        // Validación previa: todos deben estar en SELECTED.
         for seat_id in seat_ids {
             let idx = self.lookup(seat_id)?;
-            if self.seat_states[idx] != SeatState::Selected {
+            if self.seat_states[idx].load(Ordering::Acquire) != SEAT_SELECTED {
                 return Err(format!("Seat {} is not selected", seat_id));
             }
-            self.seat_states[idx] = SeatState::Available;
-            self.add_to_available(idx);
         }
+
+        // Transición atómica Selected → Available mediante compare_exchange
+        for seat_id in seat_ids {
+            let idx = self.lookup(seat_id)?;
+            let _ = self.seat_states[idx].compare_exchange(
+                SEAT_SELECTED,
+                SEAT_AVAILABLE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+        self.n_available.fetch_add(seat_ids.len(), Ordering::Relaxed);
         Ok(())
     }
 
-    /// Confirma definitivamente la compra de los asientos indicados (Selected → Booked).
+    /// Confirmación definitiva: `Selected → Booked` mediante CAS atómico por asiento.
+    ///
+    /// Si algún CAS falla (estado inconsistente), se hace rollback a `Selected`.
+    /// Estado terminal: `Booked` nunca revierte.
     ///
     /// Complejidad: O(k).
-    pub fn book_seats(&mut self, seat_ids: &[String]) -> Result<Vec<String>, String> {
-        // Validar que todos están Selected
-        let mut indices: Vec<usize> = Vec::with_capacity(seat_ids.len());
+    pub fn book_seats(&self, seat_ids: &[String]) -> Result<Vec<String>, String> {
+        let mut cas_done: Vec<usize> = Vec::with_capacity(seat_ids.len());
+
         for seat_id in seat_ids {
             let idx = self.lookup(seat_id)?;
-            match self.seat_states[idx] {
-                SeatState::Selected => indices.push(idx),
-                SeatState::Booked => {
-                    return Err(format!("Seat {} is already booked", seat_id))
-                }
-                SeatState::Available => {
-                    return Err(format!(
-                        "Seat {} must be selected before booking",
-                        seat_id
-                    ))
+
+            match self.seat_states[idx].compare_exchange(
+                SEAT_SELECTED,
+                SEAT_BOOKED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => cas_done.push(idx),
+                Err(actual) => {
+                    // Rollback: devolver los ya confirmados a Selected.
+                    for &i in &cas_done {
+                        self.seat_states[i].store(SEAT_SELECTED, Ordering::Release);
+                    }
+                    let msg = if actual == SEAT_BOOKED {
+                        format!("Seat {} is already booked", seat_id)
+                    } else {
+                        format!("Seat {} must be selected before booking", seat_id)
+                    };
+                    return Err(msg);
                 }
             }
         }
 
-        // Transición Selected → Booked
-        for &idx in &indices {
-            self.seat_states[idx] = SeatState::Booked;
-            self.n_booked += 1;
-        }
-
+        self.n_booked.fetch_add(seat_ids.len(), Ordering::Relaxed);
         Ok(seat_ids.to_vec())
     }
 
-    /// Reconstruye un `Sector` secuencial a partir del estado concurrente (para `get_venue()`).
+    /// Reconstruye un `Sector` secuencial a partir del estado atómico (snapshot).
     pub fn to_sector(&self) -> Sector {
         let seats = self
             .seat_ids
             .iter()
-            .zip(self.seat_states.iter())
-            .map(|(id, state)| Seat {
-                id: id.clone(),
-                state: state.clone(),
+            .enumerate()
+            .map(|(i, id)| {
+                let state = match self.seat_states[i].load(Ordering::Acquire) {
+                    SEAT_SELECTED => SeatState::Selected,
+                    SEAT_BOOKED => SeatState::Booked,
+                    _ => SeatState::Available,
+                };
+                Seat { id: id.clone(), state }
             })
             .collect();
 

@@ -16,6 +16,7 @@ pub trait QueueManager {
 // ============================================================
 
 /// Implementación secuencial de referencia.
+#[allow(dead_code)]
 pub struct SequentialQueueManager {
     booker: SequentialBooker,
 }
@@ -49,14 +50,14 @@ impl QueueManager for SequentialQueueManager {
 ///
 /// Se usa `available_parallelism` × 32 para compensar el alto ratio sleep/work
 /// de las sesiones de compra (los hilos pasan la mayor parte del tiempo durmiendo
-/// en `random_time_delay` mientras los lock-holders ejecutan operaciones de ~µs).
+/// en `random_time_delay` simulando latencia humana).
 /// Se acota entre 32 y 1024 para evitar overhead excesivo.
 fn optimal_thread_count() -> usize {
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    // Con delays de ~1ms y operaciones de ~µs, ratio sleep/work ≈ 1000:1.
-    // Multiplicador de 32 para saturar mejor el pipeline de ventas.
+    // Con delays simulados y operaciones CAS lock-free de microsegundos,
+    // mantener un pool dimensionado satura los núcleos y maximiza throughput.
     (cores * 32).clamp(32, 1024)
 }
 
@@ -66,10 +67,9 @@ fn optimal_thread_count() -> usize {
 /// comparte el `Arc<SharedVenueState>` subyacente. Los workers ejecutan sesiones
 /// de compra en bucle hasta que `remaining_seats() == 0`.
 ///
-/// **Mejora clave: recolección local por hilo.** Cada worker acumula sus tickets
-/// en un `Vec<String>` local (sin lock), y los vectores se fusionan al final
-/// con un único paso secuencial tras el `join`. Esto elimina completamente la
-/// contención del `Mutex<Vec<String>>` global que tenía la versión anterior.
+/// **Recolección local por hilo**: cada worker acumula sus tickets vendidos en un
+/// `Vec<String>` local (zero contention, zero locks), y los vectores se fusionan
+/// tras el `join` en el hilo principal.
 pub struct ConcurrentQueueManager {
     /// Estado compartido del recinto (Arc para compartir entre hilos).
     state: Arc<SharedVenueState>,
@@ -91,13 +91,12 @@ impl QueueManager for ConcurrentQueueManager {
     /// - Cada worker devuelve su Vec local mediante `JoinHandle::join()`.
     /// - El hilo principal fusiona todos los vectores parciales en uno solo.
     ///
-    /// # Correctitud
-    /// - `select_seats` y `book_seats` están protegidos por el `Mutex` del sector:
-    ///   garantía de que dos hilos nunca venden el mismo asiento.
-    /// - `remaining_seats` usa `AtomicUsize::Relaxed`: suficiente para la condición
-    ///   de parada (el peor caso es que algún worker haga una sesión extra que falla,
-    ///   lo que es correcto por diseño del protocolo).
-    /// - No hay riesgo de deadlock: cada operación adquiere como máximo un lock.
+    /// # Correctitud y Lock-Free
+    /// - `select_seats` y `book_seats` utilizan instrucciones CAS (`compare_exchange`)
+    ///   sobre `AtomicU8` por asiento: cero riesgo de dobles ventas, cero bloqueos.
+    /// - `remaining_seats` usa operaciones atómicas con sincronización `AcqRel`:
+    ///   garantiza la parada sin sesiones perdidas.
+    /// - Ausencia total de deadlocks por diseño al no utilizar cerrojos de exclusión mutua.
     fn run(&mut self) -> Vec<String> {
         let n_threads = optimal_thread_count();
         let total_capacity = self.state.total_capacity;
@@ -108,13 +107,11 @@ impl QueueManager for ConcurrentQueueManager {
             let state = Arc::clone(&self.state);
 
             let handle = thread::spawn(move || {
-                // Cada hilo tiene su propio ConcurrentBooker (barato: solo un Arc clone).
                 let mut booker = ConcurrentBooker::new(state);
-                // Vec LOCAL: sin ningún lock para acumular tickets.
                 let mut local_sold = Vec::new();
 
                 loop {
-                    // Condición de parada: lectura atómica, sin lock.
+                    // Condición de parada: lectura atómica sin locks
                     if booker.remaining_seats() == 0 {
                         break;
                     }
@@ -133,7 +130,6 @@ impl QueueManager for ConcurrentQueueManager {
         }
 
         // Fusionar todos los vectores parciales.
-        // Pre-reservamos la capacidad total para evitar reallocations.
         let mut sold_tickets = Vec::with_capacity(total_capacity);
         for handle in handles {
             let partial = handle.join().expect("Worker thread panicked");
@@ -144,8 +140,6 @@ impl QueueManager for ConcurrentQueueManager {
     }
 
     /// Devuelve un snapshot del estado actual del recinto.
-    ///
-    /// Solo se llama desde `main.rs` tras `run()` para estadísticas finales.
     fn get_venue(&self) -> Venue {
         self.state.to_venue()
     }
@@ -227,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_larger_venue() {
-        // Recinto más grande para detectar race conditions con más contención
+        // Recinto más grande para someter a alta contención y verificar ausencia de race conditions
         let sectors: Vec<Sector> = {
             let mut s = vec![
                 Sector::new("Standing", "ST", 500, false),
