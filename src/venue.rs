@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 // ============================================================
@@ -118,13 +119,16 @@ impl Sector {
 }
 
 // ============================================================
-// Estado interno concurrente por sector (Opción C)
+// Estado interno concurrente por sector — full O(1) operations
 // ============================================================
 
 /// Estado mutable protegido por `Mutex` para un sector concreto.
 ///
-/// Mantiene un índice O(1) de asientos disponibles mediante swap-pop,
-/// evitando scans lineales en sectores grandes (ej. Standing: 12.500 asientos).
+/// Tres índices garantizan operaciones O(1) amortizadas:
+/// - `seat_id_to_idx`: HashMap para resolver seat_id → índice en O(1).
+/// - `available`: Vec desordenado de índices disponibles (stack: push/pop O(1)).
+/// - `available_pos`: Mapa inverso seat_index → posición en `available` para
+///   eliminación O(1) por swap-pop sin búsqueda lineal.
 pub struct SectorState {
     /// Nombre descriptivo del sector.
     pub name: String,
@@ -134,11 +138,17 @@ pub struct SectorState {
     pub is_numbered: bool,
     /// IDs de todos los asientos del sector (inmutable tras construcción).
     pub seat_ids: Vec<String>,
+    /// Mapa de seat_id → índice en `seat_ids` / `seat_states` para lookup O(1).
+    seat_id_to_idx: HashMap<String, usize>,
     /// Estado de cada asiento, indexado por posición en `seat_ids`.
     pub seat_states: Vec<SeatState>,
     /// Índices (en `seat_ids`) de los asientos actualmente `Available`.
     /// Se mantiene como pila desordenada: pop/push O(1).
     pub available: Vec<usize>,
+    /// Mapa inverso: seat_index → posición en `available`.
+    /// Permite eliminar de `available` en O(1) por swap-pop sin búsqueda lineal.
+    /// Valor `usize::MAX` indica que el asiento no está en `available`.
+    available_pos: Vec<usize>,
     /// Número de asientos en estado `Booked` en este sector.
     pub n_booked: usize,
     /// Capacidad total del sector.
@@ -148,10 +158,20 @@ pub struct SectorState {
 impl SectorState {
     /// Construye el estado concurrente de un sector a partir del modelo secuencial.
     pub fn from_sector(sector: &Sector) -> Self {
+        let n = sector.seats.len();
         let seat_ids: Vec<String> = sector.seats.iter().map(|s| s.id.clone()).collect();
         let seat_states: Vec<SeatState> = sector.seats.iter().map(|s| s.state.clone()).collect();
         // Inicialmente todos los asientos están Available
-        let available: Vec<usize> = (0..seat_ids.len()).collect();
+        let available: Vec<usize> = (0..n).collect();
+        // available_pos[i] = i (posición inicial coincide con el índice)
+        let available_pos: Vec<usize> = (0..n).collect();
+
+        // Construir HashMap para lookup O(1)
+        let seat_id_to_idx: HashMap<String, usize> = seat_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
 
         SectorState {
             name: sector.name.clone(),
@@ -159,8 +179,10 @@ impl SectorState {
             is_numbered: sector.is_numbered,
             capacity: sector.capacity,
             seat_ids,
+            seat_id_to_idx,
             seat_states,
             available,
+            available_pos,
             n_booked: 0,
         }
     }
@@ -173,6 +195,7 @@ impl SectorState {
 
     /// Número de asientos vendidos definitivamente.
     #[inline]
+    #[allow(dead_code)]
     pub fn n_booked(&self) -> usize {
         self.n_booked
     }
@@ -182,34 +205,63 @@ impl SectorState {
         self.available.iter().map(|&i| self.seat_ids[i].clone()).collect()
     }
 
+    /// Busca el índice interno de un seat_id. O(1) gracias al HashMap.
+    #[inline]
+    fn lookup(&self, seat_id: &str) -> Result<usize, String> {
+        self.seat_id_to_idx
+            .get(seat_id)
+            .copied()
+            .ok_or_else(|| format!("Seat {} not found in sector {}", seat_id, self.code))
+    }
+
+    /// Elimina un seat_index del vector `available` en O(1) usando swap-pop
+    /// y actualiza el mapa inverso `available_pos`.
+    #[inline]
+    fn remove_from_available(&mut self, seat_idx: usize) {
+        let pos = self.available_pos[seat_idx];
+        debug_assert!(pos < self.available.len());
+
+        let last = self.available.len() - 1;
+        if pos != last {
+            // Swap con el último elemento
+            let swapped_seat_idx = self.available[last];
+            self.available.swap(pos, last);
+            // Actualizar la posición del elemento que se movió
+            self.available_pos[swapped_seat_idx] = pos;
+        }
+        self.available.pop();
+        // Marcar como no-disponible
+        self.available_pos[seat_idx] = usize::MAX;
+    }
+
+    /// Añade un seat_index al vector `available` y actualiza el mapa inverso.
+    #[inline]
+    fn add_to_available(&mut self, seat_idx: usize) {
+        let pos = self.available.len();
+        self.available.push(seat_idx);
+        self.available_pos[seat_idx] = pos;
+    }
+
     /// Intenta marcar los asientos indicados como `Selected` (reserva provisional).
     ///
-    /// Si algún asiento no está `Available`, deshace los cambios parciales y retorna `Err`.
-    /// Complejidad: O(k) donde k = número de asientos solicitados.
+    /// Si algún asiento no está `Available`, retorna `Err` sin modificar nada.
+    /// Complejidad: O(k) donde k = número de asientos solicitados (todas las
+    /// operaciones internas son O(1) amortizadas).
     pub fn select_seats(&mut self, seat_ids: &[String]) -> Result<(), String> {
         // Encontrar los índices de los asientos solicitados y validarlos
         let mut indices_to_select: Vec<usize> = Vec::with_capacity(seat_ids.len());
         for seat_id in seat_ids {
-            match self.seat_ids.iter().position(|id| id == seat_id) {
-                Some(idx) => {
-                    if self.seat_states[idx] != SeatState::Available {
-                        return Err(format!("Seat {} is not available", seat_id));
-                    }
-                    indices_to_select.push(idx);
-                }
-                None => return Err(format!("Seat {} not found in sector {}", seat_id, self.code)),
+            let idx = self.lookup(seat_id)?;
+            if self.seat_states[idx] != SeatState::Available {
+                return Err(format!("Seat {} is not available", seat_id));
             }
+            indices_to_select.push(idx);
         }
 
         // Transición Available → Selected y actualizar el índice de disponibles
         for &idx in &indices_to_select {
             self.seat_states[idx] = SeatState::Selected;
-            // Eliminar del vec de disponibles: swap con el último + pop → O(1)
-            if let Some(pos) = self.available.iter().position(|&i| i == idx) {
-                let last = self.available.len() - 1;
-                self.available.swap(pos, last);
-                self.available.pop();
-            }
+            self.remove_from_available(idx);
         }
 
         Ok(())
@@ -220,16 +272,12 @@ impl SectorState {
     /// Complejidad: O(k).
     pub fn deselect_seats(&mut self, seat_ids: &[String]) -> Result<(), String> {
         for seat_id in seat_ids {
-            match self.seat_ids.iter().position(|id| id == seat_id) {
-                Some(idx) => {
-                    if self.seat_states[idx] != SeatState::Selected {
-                        return Err(format!("Seat {} is not selected", seat_id));
-                    }
-                    self.seat_states[idx] = SeatState::Available;
-                    self.available.push(idx);
-                }
-                None => return Err(format!("Seat {} not found in sector {}", seat_id, self.code)),
+            let idx = self.lookup(seat_id)?;
+            if self.seat_states[idx] != SeatState::Selected {
+                return Err(format!("Seat {} is not selected", seat_id));
             }
+            self.seat_states[idx] = SeatState::Available;
+            self.add_to_available(idx);
         }
         Ok(())
     }
@@ -241,22 +289,18 @@ impl SectorState {
         // Validar que todos están Selected
         let mut indices: Vec<usize> = Vec::with_capacity(seat_ids.len());
         for seat_id in seat_ids {
-            match self.seat_ids.iter().position(|id| id == seat_id) {
-                Some(idx) => {
-                    match self.seat_states[idx] {
-                        SeatState::Selected => indices.push(idx),
-                        SeatState::Booked => {
-                            return Err(format!("Seat {} is already booked", seat_id))
-                        }
-                        SeatState::Available => {
-                            return Err(format!(
-                                "Seat {} must be selected before booking",
-                                seat_id
-                            ))
-                        }
-                    }
+            let idx = self.lookup(seat_id)?;
+            match self.seat_states[idx] {
+                SeatState::Selected => indices.push(idx),
+                SeatState::Booked => {
+                    return Err(format!("Seat {} is already booked", seat_id))
                 }
-                None => return Err(format!("Seat {} not found in sector {}", seat_id, self.code)),
+                SeatState::Available => {
+                    return Err(format!(
+                        "Seat {} must be selected before booking",
+                        seat_id
+                    ))
+                }
             }
         }
 

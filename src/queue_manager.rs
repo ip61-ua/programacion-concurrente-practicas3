@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use crate::venue::Venue;
 use crate::booking::{SequentialBooker, ConcurrentBooker, SharedVenueState, Booker};
@@ -32,8 +32,6 @@ impl QueueManager for SequentialQueueManager {
         while self.booker.remaining_seats() > 0 {
             let tickets = simulate_booking(&mut self.booker);
             sold_tickets.extend(tickets);
-
-            //println!("Venue: {} Remaining seats: {}", self.booker.get_venue_name(), self.booker.remaining_seats());
         }
         sold_tickets
     }
@@ -44,22 +42,22 @@ impl QueueManager for SequentialQueueManager {
 }
 
 // ============================================================
-// Implementación concurrente — Opción C
+// Implementación concurrente — recolección local por hilo
 // ============================================================
 
 /// Número de hilos workers.
 ///
-/// Se usa `available_parallelism` × 16 para compensar el alto ratio sleep/work
-/// de las sesiones de compra (los hilos pasan la mayor parte del tiempo durmiendo).
-/// Se acota entre 16 y 512 para evitar overhead excesivo en máquinas muy pequeñas
-/// o muy grandes.
+/// Se usa `available_parallelism` × 32 para compensar el alto ratio sleep/work
+/// de las sesiones de compra (los hilos pasan la mayor parte del tiempo durmiendo
+/// en `random_time_delay` mientras los lock-holders ejecutan operaciones de ~µs).
+/// Se acota entre 32 y 1024 para evitar overhead excesivo.
 fn optimal_thread_count() -> usize {
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
     // Con delays de ~1ms y operaciones de ~µs, ratio sleep/work ≈ 1000:1.
-    // Multiplicador conservador de 16 maximiza throughput sin saturar el scheduler.
-    (cores * 16).clamp(16, 512)
+    // Multiplicador de 32 para saturar mejor el pipeline de ventas.
+    (cores * 32).clamp(32, 1024)
 }
 
 /// Implementación concurrente del gestor de colas.
@@ -67,6 +65,11 @@ fn optimal_thread_count() -> usize {
 /// Lanza `N` hilos workers, cada uno con su propio `ConcurrentBooker` que
 /// comparte el `Arc<SharedVenueState>` subyacente. Los workers ejecutan sesiones
 /// de compra en bucle hasta que `remaining_seats() == 0`.
+///
+/// **Mejora clave: recolección local por hilo.** Cada worker acumula sus tickets
+/// en un `Vec<String>` local (sin lock), y los vectores se fusionan al final
+/// con un único paso secuencial tras el `join`. Esto elimina completamente la
+/// contención del `Mutex<Vec<String>>` global que tenía la versión anterior.
 pub struct ConcurrentQueueManager {
     /// Estado compartido del recinto (Arc para compartir entre hilos).
     state: Arc<SharedVenueState>,
@@ -81,11 +84,12 @@ impl QueueManager for ConcurrentQueueManager {
     /// Orquesta la venta concurrente de todas las entradas del recinto.
     ///
     /// # Estrategia
-    /// - Lanza `N = cores × 16` hilos workers (ver `optimal_thread_count`).
+    /// - Lanza `N = cores × 32` hilos workers (ver `optimal_thread_count`).
     /// - Cada worker tiene su propio `ConcurrentBooker` que comparte el estado vía `Arc`.
     /// - El worker ejecuta `simulate_booking` en bucle hasta que `remaining_seats() == 0`.
-    /// - Los tickets vendidos se acumulan en un `Vec` protegido por `Mutex` compartido.
-    /// - Al finalizar todos los workers, se devuelve el Vec completo.
+    /// - Los tickets vendidos se acumulan en un `Vec<String>` **local** al hilo (zero contention).
+    /// - Cada worker devuelve su Vec local mediante `JoinHandle::join()`.
+    /// - El hilo principal fusiona todos los vectores parciales en uno solo.
     ///
     /// # Correctitud
     /// - `select_seats` y `book_seats` están protegidos por el `Mutex` del sector:
@@ -98,19 +102,16 @@ impl QueueManager for ConcurrentQueueManager {
         let n_threads = optimal_thread_count();
         let total_capacity = self.state.total_capacity;
 
-        // Vec compartido donde cada worker deposita los tickets que vende.
-        // Pre-reservamos la capacidad total para evitar reallocations.
-        let sold: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::with_capacity(total_capacity)));
-
-        let mut handles = Vec::with_capacity(n_threads);
+        let mut handles: Vec<thread::JoinHandle<Vec<String>>> = Vec::with_capacity(n_threads);
 
         for _ in 0..n_threads {
             let state = Arc::clone(&self.state);
-            let sold = Arc::clone(&sold);
 
             let handle = thread::spawn(move || {
                 // Cada hilo tiene su propio ConcurrentBooker (barato: solo un Arc clone).
                 let mut booker = ConcurrentBooker::new(state);
+                // Vec LOCAL: sin ningún lock para acumular tickets.
+                let mut local_sold = Vec::new();
 
                 loop {
                     // Condición de parada: lectura atómica, sin lock.
@@ -121,26 +122,25 @@ impl QueueManager for ConcurrentQueueManager {
                     let tickets = simulate_booking(&mut booker);
 
                     if !tickets.is_empty() {
-                        // Depositamos los tickets vendidos en el Vec compartido.
-                        // Este lock se mantiene muy brevemente (solo el extend).
-                        sold.lock().unwrap().extend(tickets);
+                        local_sold.extend(tickets);
                     }
                 }
+
+                local_sold
             });
 
             handles.push(handle);
         }
 
-        // Esperar a que todos los workers terminen.
+        // Fusionar todos los vectores parciales.
+        // Pre-reservamos la capacidad total para evitar reallocations.
+        let mut sold_tickets = Vec::with_capacity(total_capacity);
         for handle in handles {
-            handle.join().expect("Worker thread panicked");
+            let partial = handle.join().expect("Worker thread panicked");
+            sold_tickets.extend(partial);
         }
 
-        // Extraer el Vec final. En este punto no hay más referencias al Arc<Mutex<>>.
-        Arc::try_unwrap(sold)
-            .expect("There are still references to sold after joining all threads")
-            .into_inner()
-            .unwrap()
+        sold_tickets
     }
 
     /// Devuelve un snapshot del estado actual del recinto.
