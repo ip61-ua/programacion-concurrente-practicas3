@@ -5,7 +5,8 @@ mod config;
 mod queue_manager;
 
 use venue::{Sector, Venue};
-use queue_manager::{SequentialQueueManager, QueueManager};
+use queue_manager::{QueueManager};
+use crate::queue_manager::ConcurrentQueueManager;
 
 pub fn initialize_venue() -> Venue {
     let mut sectors: Vec<Sector> = vec![
@@ -33,7 +34,7 @@ fn main() {
 
     let venue = initialize_venue();
 
-    let mut queue_manager = SequentialQueueManager::new(venue);
+    let mut queue_manager = ConcurrentQueueManager::new(venue);
     let sold_tickets = queue_manager.run();
 
     let time_end = std::time::Instant::now();
@@ -72,7 +73,7 @@ mod tests {
         };
         let expected_capacity = venue.total_capacity();
 
-        let mut queue_manager = SequentialQueueManager::new(venue);
+        let mut queue_manager = ConcurrentQueueManager::new(venue);
         let sold_tickets = queue_manager.run();
 
         // 1. All tickets must be sold
